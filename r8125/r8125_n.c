@@ -37,7 +37,14 @@
  */
 
 #include <linux/module.h>
+
+//The vmkernel network api is from 2.6.24,not the default 2.6.18
+#ifndef LINUX_VERSION_CODE
 #include <linux/version.h>
+#undef LINUX_VERSION_CODE
+#define LINUX_VERSION_CODE KERNEL_VERSION(2,6,24)
+#endif 
+
 #include <linux/pci.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -56,6 +63,8 @@
 #include <linux/init.h>
 #include <linux/rtnetlink.h>
 #include <linux/completion.h>
+
+#include <linux/log2.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,26)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
@@ -223,6 +232,119 @@ static int enable_ptp_master_mode = 1;
 #else
 static int enable_ptp_master_mode = 0;
 #endif
+
+
+//************************************************************************
+
+static void __pci_set_master(struct pci_dev *dev, bool enable)
+{
+    u16 old_cmd, cmd;
+
+    pci_read_config_word(dev, PCI_COMMAND, &old_cmd);
+    if (enable)
+        cmd = old_cmd | PCI_COMMAND_MASTER;
+    else
+        cmd = old_cmd & ~PCI_COMMAND_MASTER;
+    if (cmd != old_cmd) {
+        dev_dbg(&dev->dev, "%s bus mastering\n",
+            enable ? "enabling" : "disabling");
+        pci_write_config_word(dev, PCI_COMMAND, cmd);
+    }
+    dev->is_busmaster = enable;
+}
+
+static void pci_clear_master(struct pci_dev *dev){
+	__pci_set_master(dev, false);
+}
+
+bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
+{
+#ifdef __VMKLNX__
+	return false;
+#else
+    if (!dev->pm_cap)
+        return false;
+    return !!(dev->pme_support & (1 << state));
+#endif
+}
+
+int pci_wake_from_d3(struct pci_dev *dev, bool enable)
+{
+	return pci_pme_capable(dev, PCI_D3cold) ?
+    		pci_enable_wake(dev, PCI_D3cold, enable) :
+            pci_enable_wake(dev, PCI_D3hot, enable);
+}
+
+//Add by GanFan for ESXi
+
+#ifdef __VMKLNX__
+
+//extern bitreverse for symbol unresolved
+
+//VM Kernel version is 2.6 without pci_enable_msix_range
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
+int pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries,
+			       int minvec, int maxvec)
+{
+	int nvec = maxvec;
+	int rc;
+
+	if (maxvec < minvec)
+		return -ERANGE;
+
+	do {
+		rc = pci_enable_msix(dev, entries, nvec);
+		if (rc < 0) {
+			return rc;
+		} else if (rc > 0) {
+			if (rc < minvec)
+				return -ENOSPC;
+			nvec = rc;
+		}
+	} while (rc);
+
+	return nvec;
+}
+#endif 
+
+
+//Multi-queue R/W is not supported
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
+
+int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
+{
+	return 0;
+}
+
+int netif_set_real_num_rx_queues(struct net_device *dev, unsigned int rxq)
+{
+	return 0;
+}
+#endif //#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,37)
+
+//The struct skbuff definition has no pkt_type member when __VMKLNX__ is defined, so we need  detail it.
+struct __skbuff_mhead
+{
+		__u8			pkt_type:3,
+				fclone:2,
+#ifndef CONFIG_XEN
+				ipvs_property:1;
+#else
+				ipvs_property:1,
+				proto_data_valid:1,
+				proto_csum_blank:1;
+#endif
+};
+
+__u8 __skbuff_mhead_pkt_type(__u8* mhead)
+{
+	struct __skbuff_mhead * head = (struct __skbuff_mhead *) mhead;
+	return head->pkt_type;
+}
+#endif //#ifdef __VMKLNX__
+//End of porting
+//************************************************************************
+
 
 MODULE_AUTHOR("Realtek and the Linux r8125 crew <netdev@vger.kernel.org>");
 MODULE_DESCRIPTION("Realtek RTL8125 2.5Gigabit Ethernet driver");
@@ -475,7 +597,7 @@ static inline u32 netif_msg_init(int debug_value, int default_msg_enable_bits)
 
 #endif //LINUX_VERSION_CODE < KERNEL_VERSION(2,6,5)
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,22)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,22) && !defined (__VMKLNX__)
 static inline void eth_copy_and_sum (struct sk_buff *dest,
                                      const unsigned char *src,
                                      int len, int base)
@@ -749,7 +871,7 @@ static int proc_get_driver_variable(struct seq_file *m, void *v)
         seq_printf(m, "aspm\t0x%x\n", aspm);
         seq_printf(m, "s5wol\t0x%x\n", s5wol);
         seq_printf(m, "s5_keep_curr_mac\t0x%x\n", s5_keep_curr_mac);
-        seq_printf(m, "eee_enable\t0x%x\n", tp->eee.eee_enabled);
+        seq_printf(m, "eee_enable\t0x%x\n", tp->eee_enabled);
         seq_printf(m, "hwoptimize\t0x%lx\n", hwoptimize);
         seq_printf(m, "proc_init_num\t0x%x\n", proc_init_num);
         seq_printf(m, "s0_magic_packet\t0x%x\n", s0_magic_packet);
@@ -1142,8 +1264,8 @@ static int proc_get_driver_variable(char *page, char **start,
                         "RxDescLength\t0x%x\n"
                         "num_rx_rings\t0x%x\n"
                         "num_tx_rings\t0x%x\n"
-                        "tot_rx_rings\t0x%x\n"
-                        "tot_tx_rings\t0x%x\n"
+//                        "tot_rx_rings\t0x%x\n"
+//                        "tot_tx_rings\t0x%x\n"
                         "EnableRss\t0x%x\n"
                         "EnablePtp\t0x%x\n"
                         "ptp_master_mode\t0x%x\n"
@@ -1237,7 +1359,11 @@ static int proc_get_driver_variable(char *page, char **start,
                         aspm,
                         s5wol,
                         s5_keep_curr_mac,
+#ifdef EEE_SUPPORT
                         tp->eee.eee_enabled,
+#else
+						0,
+#endif
                         hwoptimize,
                         proc_init_num,
                         s0_magic_packet,
@@ -1257,8 +1383,8 @@ static int proc_get_driver_variable(char *page, char **start,
                         tp->RxDescLength,
                         tp->num_rx_rings,
                         tp->num_tx_rings,
-                        tp->tot_rx_rings,
-                        tp->tot_tx_rings,
+//                        tp->tot_rx_rings,
+//                        tp->tot_tx_rings,
                         tp->EnableRss,
                         tp->EnablePtp,
                         tp->ptp_master_mode,
@@ -1507,7 +1633,7 @@ static int proc_get_extended_registers(char *page, char **start,
         spin_unlock_irqrestore(&tp->lock, flags);
 
         len += snprintf(page + len, count - len, "\n");
-out:
+//out:
         *eof = 1;
         return len;
 }
@@ -3914,6 +4040,7 @@ rtl8125_phy_setup_force_mode(struct net_device *dev, u32 speed, u8 duplex)
 static void
 rtl8125_set_pci_pme(struct rtl8125_private *tp, int set)
 {
+#if !defined (__VMKLNX__)
         struct pci_dev *pdev = tp->pci_dev;
         u16 pmc;
 
@@ -3927,6 +4054,7 @@ rtl8125_set_pci_pme(struct rtl8125_private *tp, int set)
         else
                 pmc &= ~PCI_PM_CTRL_PME_ENABLE;
         pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, pmc);
+#endif
 }
 
 static void
@@ -4439,6 +4567,8 @@ rtl8125_rx_desc_opts2(struct rtl8125_private *tp,
                 return desc->opts2;
 }
 
+#ifdef CONFIG_R8125_VLAN
+
 static void
 rtl8125_clear_rx_desc_opts2(struct rtl8125_private *tp,
                             struct RxDesc *desc)
@@ -4448,8 +4578,6 @@ rtl8125_clear_rx_desc_opts2(struct rtl8125_private *tp,
         else
                 desc->opts2 = 0;
 }
-
-#ifdef CONFIG_R8125_VLAN
 
 static inline u32
 rtl8125_tx_vlan_tag(struct rtl8125_private *tp,
@@ -5070,6 +5198,7 @@ static int _kc_ethtool_op_set_sg(struct net_device *dev, u32 data)
 }
 #endif
 
+#ifdef EEE_SUPPORT
 static int rtl8125_enable_eee(struct rtl8125_private *tp)
 {
         struct ethtool_eee *eee = &tp->eee;
@@ -5131,6 +5260,7 @@ static int rtl8125_enable_eee(struct rtl8125_private *tp)
 
         return ret;
 }
+#endif
 
 static int rtl8125_disable_eee(struct rtl8125_private *tp)
 {
@@ -9503,7 +9633,7 @@ rtl8125_hw_phy_config_8125b_2(struct net_device *dev)
                                );
 
 
-        RTL_W16(tp, EEE_TXIDLE_TIMER_8125, tp->eee.tx_lpi_timer);
+        RTL_W16(tp, EEE_TXIDLE_TIMER_8125, dev->mtu + ETH_HLEN + 0x20);
 
         mdio_direct_write_phy_ocp(tp, 0xB87C, 0x80F5);
         mdio_direct_write_phy_ocp(tp, 0xB87E, 0x760E);
@@ -9642,9 +9772,11 @@ rtl8125_hw_phy_config(struct net_device *dev)
         rtl8125_mdio_write(tp, 0x1F, 0x0000);
 
         if (HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp)) {
+#ifdef EEE_SUPPORT
                 if (tp->eee.eee_enabled)
                         rtl8125_enable_eee(tp);
                 else
+#endif
                         rtl8125_disable_eee(tp);
         }
 }
@@ -10165,6 +10297,7 @@ rtl8125_init_software_variable(struct net_device *dev)
         dev->max_mtu = tp->max_jumbo_frame_size;
 #endif //LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 
+#ifdef EEE_SUPPORT
         if (tp->mcfg != CFG_METHOD_DEFAULT) {
                 struct ethtool_eee *eee = &tp->eee;
 
@@ -10180,6 +10313,7 @@ rtl8125_init_software_variable(struct net_device *dev)
                 eee->advertised = mmd_eee_adv_to_ethtool_adv_t(MDIO_EEE_1000T | MDIO_EEE_100TX);
                 eee->tx_lpi_timer = dev->mtu + ETH_HLEN + 0x20;
         }
+#endif
 
         tp->ptp_master_mode = enable_ptp_master_mode;
 }
@@ -11744,6 +11878,7 @@ static int rtl8125_poll_msix_other(napi_ptr napi, napi_budget budget)
 
         //suppress unused variable
         (void)(dev);
+        (void)(work_to_do);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
         RTL_NETIF_RX_COMPLETE(dev, napi, work_to_do);
@@ -13600,6 +13735,7 @@ static int msdn_giant_send_check(struct sk_buff *skb)
 static u32
 rtl8125_get_patch_pad_len(struct sk_buff *skb)
 {
+#if !defined (__VMKLNX__)
         u32 pad_len = 0;
         int trans_data_len;
         u32 hdr_len;
@@ -13615,13 +13751,13 @@ rtl8125_get_patch_pad_len(struct sk_buff *skb)
                 goto no_padding;
 
         trans_data_len = pkt_len -
-                         (skb->transport_header -
+                         (skb_transport_header(skb) -
                           skb_headroom(skb));
         if (ip_protocol == IPPROTO_UDP) {
                 if (trans_data_len > 3 && trans_data_len < MIN_PATCH_LEN) {
                         u16 dest_port = 0;
 
-                        skb_copy_bits(skb, skb->transport_header - skb_headroom(skb) + 2, &dest_port, 2);
+                        skb_copy_bits(skb, skb_transport_header(skb) - skb_headroom(skb) + 2, &dest_port, 2);
                         dest_port = ntohs(dest_port);
 
                         if (dest_port == 0x13f ||
@@ -13647,6 +13783,7 @@ out:
         return pad_len;
 
 no_padding:
+#endif
 
         return 0;
 }
@@ -13791,6 +13928,9 @@ rtl8125_tso_csum(struct sk_buff *skb,
                 skb_checksum_help(&skb, 0);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19) && LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,10)
                 skb_checksum_help(skb, 0);
+#elif defined (__VMKLNX__)
+                skb_checksum_help(skb, 0);
+//				r8125_skb_checksum_help(skb);
 #else
                 skb_checksum_help(skb);
 #endif
@@ -14327,7 +14467,7 @@ process_pkt:
                         skb_put(skb, pkt_size);
                         skb->protocol = eth_type_trans(skb, dev);
 
-                        if (skb->pkt_type == PACKET_MULTICAST)
+                        if (__skbuff_mhead_pkt_type(&skb->mhead) == PACKET_MULTICAST)
                                 RTLDEV->stats.multicast++;
 
                         if (rtl8125_rx_vlan_skb(tp, desc, skb) < 0)

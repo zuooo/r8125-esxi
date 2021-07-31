@@ -35,14 +35,32 @@
 #ifndef __R8125_H
 #define __R8125_H
 
-//#include <linux/pci.h>
+//The vmkernel network api is from 2.6.24,not the default 2.6.18
+#ifndef LINUX_VERSION_CODE
+#include <linux/version.h>
+#undef LINUX_VERSION_CODE
+#define LINUX_VERSION_CODE KERNEL_VERSION(2,6,24)
+#endif 
+
 #include <linux/ethtool.h>
 #include <linux/interrupt.h>
-#include <linux/version.h>
+
+//#ifdef ENABLE_DASH_SUPPORT
 #include "r8125_dash.h"
+//#endif 
+
+#ifdef ENABLE_REALWOW_SUPPORT
 #include "r8125_realwow.h"
+#endif 
+
+#ifdef ENABLE_PTP_SUPPORT
 #include "r8125_ptp.h"
+#endif 
+
+#ifdef ENABLE_RSS_SUPPORT
 #include "r8125_rss.h"
+#endif 
+
 #ifdef ENABLE_LIB_SUPPORT
 #include "r8125_lib.h"
 #endif
@@ -61,7 +79,7 @@ typedef int netdev_tx_t;
 #define skb_transport_offset(skb) (skb->h.raw - skb->data)
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,26)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,26) && !defined (__VMKLNX__)
 #define device_set_wakeup_enable(dev, val)	do {} while (0)
 #endif
 
@@ -2032,7 +2050,9 @@ struct rtl8125_private {
         //Realwow--------------
 #endif //ENABLE_REALWOW_SUPPORT
 
+#ifdef EEE_SUPPORT
         struct ethtool_eee eee;
+#endif
 
 #ifdef ENABLE_R8125_PROCFS
         //Procfs support
