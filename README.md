@@ -1,3 +1,8 @@
+!!! still testing...
+
+!!! DO NOT USE
+
+
 # Realtek RTL8125 NIC driver for ESXi 6.7
 
 This source code is based on realtek official source, VMware-ESXI-67U3-ODP and VMware-TOOLS-10.2.0-ODP.
