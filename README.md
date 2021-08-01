@@ -1,6 +1,6 @@
-!!! still testing...
+!!! LACK OF TESTING, Please test and feedback.
 
-!!! DO NOT USE
+!!! WARNING: Do not use in production environment.
 
 
 # Realtek RTL8125 NIC driver for ESXi 6.7
