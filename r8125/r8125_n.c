@@ -280,6 +280,31 @@ int pci_wake_from_d3(struct pci_dev *dev, bool enable)
 #ifdef __VMKLNX__
 
 //extern bitreverse for symbol unresolved
+#define CRCPOLY_LE 0xedb88320
+
+u32 crc32_le(u32 crc, unsigned char const *p, size_t len)
+{
+	int i;
+	while (len--) {
+		crc ^= *p++;
+		for (i = 0; i < 8; i++)
+			crc = (crc >> 1) ^ ((crc & 1) ? CRCPOLY_LE : 0);
+	}
+	return crc;
+}
+
+u32 bitreverse(u32 x)
+{
+	x = (x >> 16) | (x << 16);
+	x = (x >> 8 & 0x00ff00ff) | (x << 8 & 0xff00ff00);
+	x = (x >> 4 & 0x0f0f0f0f) | (x << 4 & 0xf0f0f0f0);
+	x = (x >> 2 & 0x33333333) | (x << 2 & 0xcccccccc);
+	x = (x >> 1 & 0x55555555) | (x << 1 & 0xaaaaaaaa);
+	return x;
+}
+
+#define ether_crc(length, data)    bitreverse(crc32_le(~0, data, length))
+
 
 //VM Kernel version is 2.6 without pci_enable_msix_range
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
@@ -322,6 +347,110 @@ int netif_set_real_num_rx_queues(struct net_device *dev, unsigned int rxq)
 }
 #endif //#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,37)
 
+unsigned int skb_checksum(const struct sk_buff *skb, int offset,
+                          int len, unsigned int csum)
+{
+        int start = skb_headlen(skb);
+        int i, copy = start - offset;
+        int pos = 0;
+
+        /* Checksum header. */
+        if (copy > 0) {
+                if (copy > len)
+                        copy = len;
+                csum = csum_partial(skb->data + offset, copy, csum);
+                if ((len -= copy) == 0)
+                        return csum;
+                offset += copy;
+                pos     = copy;
+        }
+
+        for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+                int end;
+
+                BUG_TRAP(start <= offset + len);
+
+                end = start + skb_shinfo(skb)->frags[i].size;
+                if ((copy = end - offset) > 0) {
+                        unsigned int csum2;
+                        u8 *vaddr;
+                        skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+
+                        if (copy > len)
+                                copy = len;
+                        vaddr = kmap_skb_frag(frag);
+                        csum2 = csum_partial(vaddr + frag->page_offset +
+                                             offset - start, copy, 0);
+                        kunmap_skb_frag(vaddr);
+                        csum = csum_block_add(csum, csum2, pos);
+                        if (!(len -= copy))
+                                return csum;
+
+                        offset += copy;
+                        pos    += copy;
+                }
+                start = end;
+        }
+                if (skb_shinfo(skb)->frag_list) {
+                        struct sk_buff *list = skb_shinfo(skb)->frag_list;
+
+                        for (; list; list = list->next) {
+                                int end;
+
+                                BUG_TRAP(start <= offset + len);
+
+                                end = start + list->len;
+                                if ((copy = end - offset) > 0) {
+                                        unsigned int csum2;
+                                        if (copy > len)
+                                                copy = len;
+                                        csum2 = skb_checksum(list, offset - start,
+                                                             copy, 0);
+                                        csum = csum_block_add(csum, csum2, pos);
+                                        if ((len -= copy) == 0)
+                                                return csum;
+                                        offset += copy;
+                                        pos    += copy;
+                                }
+                                start = end;
+                        }
+                }
+                BUG_ON(len);
+
+                return csum;
+}
+
+int r8125_skb_checksum_help(struct sk_buff *skb)
+{
+	unsigned int csum;
+	int ret = 0, offset = skb->h.raw - skb->data;
+
+	if (unlikely(skb_shinfo(skb)->gso_size)) {
+		/* Let GSO fix up the checksum. */
+		goto out_set_summed;
+	}
+
+	if (skb_cloned(skb)) {
+		ret = pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+		if (ret)
+			goto out;
+	}
+
+	BUG_ON(offset > (int)skb->len);
+	csum = skb_checksum(skb, offset, skb->len-offset, 0);
+
+	offset = skb->tail - skb->h.raw;
+	BUG_ON(offset <= 0);
+	BUG_ON(skb->csum + 2 > offset);
+
+	*(u16*)(skb->h.raw + skb->csum) = csum_fold(csum);
+
+out_set_summed:
+	skb->ip_summed = CHECKSUM_NONE;
+out:	
+	return ret;
+}
+
 //The struct skbuff definition has no pkt_type member when __VMKLNX__ is defined, so we need  detail it.
 struct __skbuff_mhead
 {
@@ -341,6 +470,48 @@ __u8 __skbuff_mhead_pkt_type(__u8* mhead)
 	struct __skbuff_mhead * head = (struct __skbuff_mhead *) mhead;
 	return head->pkt_type;
 }
+
+int __skb_pad(struct sk_buff *skb, int pad)
+{
+	int err;
+	int ntail;
+	
+	/* If the skbuff is non linear tailroom is always zero.. */
+	if (!skb_cloned(skb) && skb_tailroom(skb) >= pad) {
+		memset(skb->data+skb->len, 0, pad);
+		return 0;
+	}
+
+	ntail = skb->data_len + pad - (skb->end - skb->tail);
+	if (likely(skb_cloned(skb) || ntail > 0)) {
+		err = pskb_expand_head(skb, 0, ntail, GFP_ATOMIC);
+		if (unlikely(err))
+			goto free_skb;
+	}
+
+	/* FIXME: The use of this function with non-linear skb's really needs
+	 * to be audited.
+	 */
+	err = skb_linearize(skb);
+	if (unlikely(err))
+		goto free_skb;
+
+	memset(skb->data + skb->len, 0, pad);
+	return 0;
+
+free_skb:
+	kfree_skb(skb);
+	return err;
+}
+
+static inline int __skb_padto(struct sk_buff *skb, unsigned int len)
+{
+	unsigned int size = skb->len;
+	if (likely(size >= len))
+		return 0;
+	return __skb_pad(skb, len-size);
+}
+
 #endif //#ifdef __VMKLNX__
 //End of porting
 //************************************************************************
@@ -1359,7 +1530,7 @@ static int proc_get_driver_variable(char *page, char **start,
                         aspm,
                         s5wol,
                         s5_keep_curr_mac,
-#ifdef EEE_SUPPORT
+#ifdef ENABLE_EEE_SUPPORT
                         tp->eee.eee_enabled,
 #else
 						0,
@@ -5198,7 +5369,7 @@ static int _kc_ethtool_op_set_sg(struct net_device *dev, u32 data)
 }
 #endif
 
-#ifdef EEE_SUPPORT
+#ifdef ENABLE_EEE_SUPPORT
 static int rtl8125_enable_eee(struct rtl8125_private *tp)
 {
         struct ethtool_eee *eee = &tp->eee;
@@ -5504,7 +5675,7 @@ exit_unlock:
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0) */
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2,4,22)
-static const struct ethtool_ops rtl8125_ethtool_ops = {
+static struct ethtool_ops rtl8125_ethtool_ops = {
         .get_drvinfo        = rtl8125_get_drvinfo,
         .get_regs_len       = rtl8125_get_regs_len,
         .get_link       = ethtool_op_get_link,
@@ -9772,7 +9943,7 @@ rtl8125_hw_phy_config(struct net_device *dev)
         rtl8125_mdio_write(tp, 0x1F, 0x0000);
 
         if (HW_HAS_WRITE_PHY_MCU_RAM_CODE(tp)) {
-#ifdef EEE_SUPPORT
+#ifdef ENABLE_EEE_SUPPORT
                 if (tp->eee.eee_enabled)
                         rtl8125_enable_eee(tp);
                 else
@@ -10297,7 +10468,7 @@ rtl8125_init_software_variable(struct net_device *dev)
         dev->max_mtu = tp->max_jumbo_frame_size;
 #endif //LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,0)
 
-#ifdef EEE_SUPPORT
+#ifdef ENABLE_EEE_SUPPORT
         if (tp->mcfg != CFG_METHOD_DEFAULT) {
                 struct ethtool_eee *eee = &tp->eee;
 
@@ -13387,7 +13558,7 @@ _rtl8125_wait_for_quiescence(struct net_device *dev)
         rtl8125_disable_napi(tp);
 #endif//CONFIG_R8125_NAPI
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,67)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2,5,67) && !defined (__VMKLNX__)
         /* Give a racing hard_start_xmit a few cycles to complete. */
         synchronize_net();
 #endif
@@ -13691,7 +13862,7 @@ u8 rtl8125_get_l4_protocol(struct sk_buff *skb)
 
 static bool rtl8125_skb_pad_with_len(struct sk_buff *skb, unsigned int len)
 {
-        if (skb_padto(skb, len))
+        if (__skb_padto(skb, len))
                 return false;
         skb_put(skb, len - skb->len);
         return true;
@@ -13924,13 +14095,12 @@ rtl8125_tso_csum(struct sk_buff *skb,
         }
 
         if (sw_calc_csum) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,10) && LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,7)
+#if defined (__VMKLNX__)
+				r8125_skb_checksum_help(skb);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(2,6,10) && LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,7)
                 skb_checksum_help(&skb, 0);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19) && LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,10)
                 skb_checksum_help(skb, 0);
-#elif defined (__VMKLNX__)
-                skb_checksum_help(skb, 0);
-//				r8125_skb_checksum_help(skb);
 #else
                 skb_checksum_help(skb);
 #endif
@@ -14787,12 +14957,13 @@ static void rtl8125_shutdown(struct pci_dev *pdev)
 
         rtl8125_close(dev);
         rtl8125_disable_msi(pdev, tp);
-
+#if !defined (__VMKLNX__)
         if (system_state == SYSTEM_POWER_OFF) {
                 pci_clear_master(tp->pci_dev);
                 pci_wake_from_d3(pdev, tp->wol_enabled);
                 pci_set_power_state(pdev, PCI_D3hot);
         }
+#endif
 }
 #endif
 

@@ -2050,7 +2050,7 @@ struct rtl8125_private {
         //Realwow--------------
 #endif //ENABLE_REALWOW_SUPPORT
 
-#ifdef EEE_SUPPORT
+#ifdef ENABLE_EEE_SUPPORT
         struct ethtool_eee eee;
 #endif
 
