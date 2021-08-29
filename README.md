@@ -40,3 +40,11 @@ TOOLCHAIN packages, contains all the used toolchains during the build process, t
 - SHA1SUM: 	09e18fa77bb2cbc7a9fffc874715602f2ab0aad6
 - SHA256SUM: 	4545117140af9fe4ba6969274834a95ecf173ce7836b2a6fbccb54aacb1da214
 - https://download3.vmware.com/software/vsphere67/open-source/VMware-TOOLS-10.2.0-ODP.iso
+
+# test
+
+`
+esxcli software vib remove -n net-r8125
+esxcli software vib install -v /vmfs/volumes/datastore1/net-r8125-9.006.04-1.vib
+`
+
